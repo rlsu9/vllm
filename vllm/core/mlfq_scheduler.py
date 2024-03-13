@@ -138,7 +138,7 @@ class MLFQScheduler:
         proactive_offloading: bool = True,
         num_min_free_blocks_threshold: int = 0,
         num_queues_for_prediction: int = 2,
-        use_skip_join: bool = True,
+        use_skip_join: bool = False,
     ) -> None:
         self.scheduler_config = scheduler_config
         self.cache_config = cache_config
@@ -157,17 +157,17 @@ class MLFQScheduler:
             assert (
                 scheduler_config.profiling_file is not None
             ), "skip-join MLFQ needs profiling results"
-        profiling_db = ProfilingDatabase(
-            scheduler_config.profiling_file, new_database=False
-        )
-        self.profile_res = profiling_db.results[scheduler_config.model_name]
+        # profiling_db = ProfilingDatabase(
+        #     scheduler_config.profiling_file, new_database=False
+        # )
+        # self.profile_res = profiling_db.results[scheduler_config.model_name]
 
         # Multi-level Feedback Queue
         self.priority_queues: self.Priority_Queues = self.Priority_Queues()
         # Since pipeline parallelism is used, there may be multiple batches under processing.
         self.cur_index = -1
         self.batch_queues = [
-            [] for _ in range(scheduler_config.pipeline_parallel_size)
+            [] for _ in range(1)
         ]  # List[List[Request]]
 
         # Just some magic numbers, need to be tuned.
@@ -248,12 +248,13 @@ class MLFQScheduler:
                         continue
                     seq.status = SequenceStatus.FINISHED_ABORTED
                     self.free_seq(seq)
+                self.priority_queues.del_request(request_id)
 
     def has_unfinished_seqs(self) -> bool:
-        return self.waiting or self.running or self.swapped
+        return self.priority_queues
 
     def get_num_unfinished_seq_groups(self) -> int:
-        return len(self.waiting) + len(self.running) + len(self.swapped)
+        return len(self.priority_queues)
 
     def _schedule(self) -> SchedulerOutputs:
         # Blocks that need to be swapped or copied before model execution.

@@ -310,6 +310,7 @@ class SequenceGroup:
         sampling_params: SamplingParams,
         arrival_time: float,
         lora_request: Optional[LoRARequest] = None,
+        priority: int = 0
     ) -> None:
         self.request_id = request_id
         self.seqs_dict = {seq.seq_id: seq for seq in seqs}
@@ -322,6 +323,7 @@ class SequenceGroup:
         self.lora_request = lora_request
         self.prompt_logprobs: Optional[PromptLogprobs] = None
         self.state = SequenceGroupState()
+        self.priority = priority
 
     @property
     def prompt(self) -> str:
@@ -338,6 +340,12 @@ class SequenceGroup:
     @property
     def lora_int_id(self) -> int:
         return self.lora_request.lora_int_id if self.lora_request else 0
+    
+    def get_priority(self) -> int:
+        return self.priority
+    
+    def set_priority(self, priority: int) -> None:
+        self.priority = priority
 
     def get_last_latency(self, now: float) -> float:
         """Gets last token latency for Request level timings."""
