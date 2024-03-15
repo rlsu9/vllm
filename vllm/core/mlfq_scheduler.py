@@ -263,6 +263,30 @@ class MLFQScheduler:
 
     def get_num_unfinished_seq_groups(self) -> int:
         return len(self.waiting) + len(self.running) + len(self.swapped)
+    
+    def prevent_starvation(self, priority_queues) -> None:
+        """
+        Prevent starvation of the request by promoting it to the top queue.
+        """
+        promote_reqs = []
+        cur_time = time.time()
+        
+        for q in priority_queues.queues:
+            buffer = []
+            while len(q) > 0:
+                request = q.pop_front()
+                if cur_time - request.metrics.time_in_queue  >= self.starvation_threshold:
+                    promote_reqs.append(request)
+                else:
+                    buffer.append(request)
+            
+            for request in buffer:
+                q.push_back(request)
+        
+        # promote the requests in starvation
+        for request in promote_reqs:
+            request.set_priority(0)
+            priority_queues.push_front(request)
 
     def _schedule(self) -> SchedulerOutputs:
         # Blocks that need to be swapped or copied before model execution.
@@ -361,7 +385,12 @@ class MLFQScheduler:
                 scheduled.append(seq_group)
 
             self.waiting.extend_front(leftover_waiting_sequences)
-
+            
+            self.iteration_num += 1
+            
+            if self.iteration_num % self.starvation_period == 0:
+                self.prevent_starvation()
+    
             if scheduled or ignored_seq_groups:
                 scheduler_outputs = SchedulerOutputs(
                     scheduled_seq_groups=scheduled,
@@ -448,6 +477,11 @@ class MLFQScheduler:
                 self.running.append(seq_group)
 
             self.swapped.extend_front(leftover_swapped)
+            
+        self.iteration_num += 1
+            
+        if self.iteration_num % self.starvation_period == 0:
+            self.prevent_starvation()
 
         # Each sequence in the generation phase only takes one token slot.
         # Therefore, the number of batched tokens is equal to the number of
