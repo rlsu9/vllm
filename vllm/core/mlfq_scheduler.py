@@ -84,6 +84,10 @@ class MLFQScheduler:
 
         def pop_front(self):
             return self.requests.pop(0)
+        
+        def extend_front(self, requests_deque: deque) -> None:
+            for request in reversed(requests_deque):
+                self.push_front(request)
 
         def __len__(self):
             return len(self.requests)
@@ -126,6 +130,11 @@ class MLFQScheduler:
                             num_requests_in_top_queue += len(self.queues[priority + i])
                     return num_requests_in_top_queue
             return 0
+        
+        def extend_front(self, requests_deque: deque) -> None:
+            for request in requests_deque:
+                self.add_new_queue(request.get_priority())
+                self.queues[request.get_priority()].extend_front(deque([request]))
 
         def __len__(self):
             return sum([len(q) for q in self.queues])
@@ -163,7 +172,7 @@ class MLFQScheduler:
         # self.profile_res = profiling_db.results[scheduler_config.model_name]
 
         # Multi-level Feedback Queue
-        self.priority_queues: self.Priority_Queues = self.Priority_Queues()
+        self.waiting: self.Priority_Queues = self.Priority_Queues()
         # Since pipeline parallelism is used, there may be multiple batches under processing.
         self.cur_index = -1
         self.batch_queues = [
@@ -190,12 +199,10 @@ class MLFQScheduler:
             sliding_window=self.cache_config.sliding_window,
             enable_caching=self.cache_config.enable_prefix_caching)
 
-        # Sequence groups in the WAITING state.
-        self.waiting: Deque[SequenceGroup] = deque()
         # Sequence groups in the RUNNING state.
         self.running: Deque[SequenceGroup] = deque()
         # Sequence groups in the SWAPPED state.
-        self.swapped: Deque[SequenceGroup] = deque()
+        self.swapped: self.Priority_Queues = self.Priority_Queues()
 
     @property
     def lora_enabled(self) -> bool:
@@ -208,10 +215,10 @@ class MLFQScheduler:
             while pow(self.threshold, priority) * self.base_quantum < prompt_time:
                 priority += 1
             seq_group.set_priority(priority)
-            self.priority_queues.push_back(seq_group)
+            self.waiting.push_back(seq_group)
         else:
             seq_group.set_priority(0)
-            self.priority_queues.push_back(seq_group)
+            self.waiting.push_back(seq_group)
 
     def abort_seq_group(self, request_id: Union[str, Iterable[str]]) -> None:
         """Aborts a sequence group with the given ID.
@@ -229,7 +236,7 @@ class MLFQScheduler:
         if isinstance(request_id, str):
             request_id = (request_id, )
         request_ids = set(request_id)
-        for state_queue in [self.waiting, self.running, self.swapped]:
+        for state_queue in [self.running]:
             aborted_groups: List[SequenceGroup] = []
             for seq_group in state_queue:
                 if not request_ids:
@@ -248,13 +255,14 @@ class MLFQScheduler:
                         continue
                     seq.status = SequenceStatus.FINISHED_ABORTED
                     self.free_seq(seq)
-                self.priority_queues.del_request(request_id)
+        for request_id in request_ids:
+             self.waiting.del_request(request_id)
 
     def has_unfinished_seqs(self) -> bool:
-        return self.priority_queues
+        return self.waiting
 
     def get_num_unfinished_seq_groups(self) -> int:
-        return len(self.priority_queues)
+        return len(self.waiting) + len(self.running) + len(self.swapped)
 
     def _schedule(self) -> SchedulerOutputs:
         # Blocks that need to be swapped or copied before model execution.
@@ -266,7 +274,7 @@ class MLFQScheduler:
         now = time.monotonic()
 
         # Join waiting sequences if possible.
-        if not self.swapped:
+        if  len(self.swapped) == 0:
             ignored_seq_groups: List[SequenceGroup] = []
             scheduled: List[SequenceGroup] = []
             # The total number of sequences on the fly, including the
@@ -282,8 +290,8 @@ class MLFQScheduler:
             # sequence groups are added to the front and the new sequence groups
             # are added to the back.
             leftover_waiting_sequences = deque()
-            while self.waiting:
-                seq_group = self.waiting[0]
+            while len(self.waiting):
+                seq_group = self.waiting.pop_front()
                 waiting_seqs = seq_group.get_seqs(
                     status=SequenceStatus.WAITING)
                 assert len(waiting_seqs) == 1, (
@@ -297,12 +305,12 @@ class MLFQScheduler:
                     for seq in waiting_seqs:
                         seq.status = SequenceStatus.FINISHED_IGNORED
                     ignored_seq_groups.append(seq_group)
-                    self.waiting.popleft()
                     continue
 
                 # If the sequence group cannot be allocated, stop.
                 can_allocate = self.block_manager.can_allocate(seq_group)
                 if can_allocate == AllocStatus.LATER:
+                    self.waiting.push_front(seq_group)
                     break
                 elif can_allocate == AllocStatus.NEVER:
                     logger.warning(
@@ -311,7 +319,6 @@ class MLFQScheduler:
                     for seq in waiting_seqs:
                         seq.status = SequenceStatus.FINISHED_IGNORED
                     ignored_seq_groups.append(seq_group)
-                    self.waiting.popleft()
                     continue
 
                 lora_int_id = 0
@@ -322,7 +329,6 @@ class MLFQScheduler:
                         # We don't have a space for another LoRA, so
                         # we ignore this request for now.
                         leftover_waiting_sequences.appendleft(seq_group)
-                        self.waiting.popleft()
                         continue
 
                 # If the number of batched tokens exceeds the limit, stop.
@@ -330,6 +336,7 @@ class MLFQScheduler:
                 num_batched_tokens = len(new_seq_lens) * max(new_seq_lens)
                 if (num_batched_tokens >
                         self.scheduler_config.max_num_batched_tokens):
+                    self.waiting.push_front(seq_group)
                     break
 
                 # The total number of sequences in the RUNNING state should not
@@ -337,22 +344,23 @@ class MLFQScheduler:
                 num_new_seqs = seq_group.get_max_num_running_seqs()
                 if (num_curr_seqs + num_new_seqs >
                         self.scheduler_config.max_num_seqs):
+                    self.waiting.push_front(seq_group)
                     break
 
                 num_paddings = num_batched_tokens - sum(new_seq_lens)
                 if num_paddings > self.scheduler_config.max_paddings:
+                    self.waiting.push_front(seq_group)
                     break
                 seq_lens = new_seq_lens
 
                 if lora_int_id > 0:
                     curr_loras.add(lora_int_id)
-                self.waiting.popleft()
                 self._allocate(seq_group)
                 self.running.append(seq_group)
                 num_curr_seqs += num_new_seqs
                 scheduled.append(seq_group)
 
-            self.waiting.extendleft(leftover_waiting_sequences)
+            self.waiting.extend_front(leftover_waiting_sequences)
 
             if scheduled or ignored_seq_groups:
                 scheduler_outputs = SchedulerOutputs(
@@ -382,12 +390,12 @@ class MLFQScheduler:
                 if self.running:
                     # Preempt the lowest-priority sequence groups.
                     victim_seq_group = self.running.pop()
-                    self._preempt(victim_seq_group, blocks_to_swap_out)
+                    self._preempt(victim_seq_group, blocks_to_swap_out, PreemptionMode.SWAP)
                     preempted.append(victim_seq_group)
                 else:
                     # No other sequence groups can be preempted.
                     # Preempt the current sequence group.
-                    self._preempt(seq_group, blocks_to_swap_out)
+                    self._preempt(seq_group, blocks_to_swap_out, PreemptionMode.SWAP)
                     preempted.append(seq_group)
                     break
             else:
@@ -397,7 +405,7 @@ class MLFQScheduler:
         self.running = running
 
         # Swap in the sequence groups in the SWAPPED state if possible.
-        self.swapped = self.policy.sort_by_priority(now, self.swapped)
+        # self.swapped = self.policy.sort_by_priority(now, self.swapped)
         if not preempted:
             num_curr_seqs = sum(seq_group.get_max_num_running_seqs()
                                 for seq_group in self.running)
@@ -407,8 +415,8 @@ class MLFQScheduler:
 
             leftover_swapped = deque()
 
-            while self.swapped:
-                seq_group = self.swapped[0]
+            while len(self.swapped):
+                seq_group = self.swapped.pop_front()
                 lora_int_id = 0
                 if self.lora_enabled:
                     lora_int_id = seq_group.lora_int_id
@@ -417,11 +425,11 @@ class MLFQScheduler:
                         # We don't have a space for another LoRA, so
                         # we ignore this request for now.
                         leftover_swapped.appendleft(seq_group)
-                        self.swapped.popleft()
                         continue
 
                 # If the sequence group cannot be swapped in, stop.
                 if not self.block_manager.can_swap_in(seq_group):
+                    self.swapped.push_front(seq_group)
                     break
 
                 # The total number of sequences in the RUNNING state should not
@@ -429,17 +437,17 @@ class MLFQScheduler:
                 num_new_seqs = seq_group.get_max_num_running_seqs()
                 if (num_curr_seqs + num_new_seqs >
                         self.scheduler_config.max_num_seqs):
+                    self.swapped.push_front(seq_group)
                     break
 
                 if lora_int_id > 0:
                     curr_loras.add(lora_int_id)
-                self.swapped.popleft()
                 self._swap_in(seq_group, blocks_to_swap_in)
                 self._append_slot(seq_group, blocks_to_copy)
                 num_curr_seqs += num_new_seqs
                 self.running.append(seq_group)
 
-            self.swapped.extendleft(leftover_swapped)
+            self.swapped.extend_front(leftover_swapped)
 
         # Each sequence in the generation phase only takes one token slot.
         # Therefore, the number of batched tokens is equal to the number of
@@ -563,7 +571,7 @@ class MLFQScheduler:
             self.block_manager.free(seq)
         # NOTE: For FCFS, we insert the preempted sequence group to the front
         # of the waiting queue.
-        self.waiting.appendleft(seq_group)
+        self.waiting.push_front(seq_group)
 
     def _preempt_by_swap(
         self,
@@ -571,7 +579,7 @@ class MLFQScheduler:
         blocks_to_swap_out: Dict[int, int],
     ) -> None:
         self._swap_out(seq_group, blocks_to_swap_out)
-        self.swapped.append(seq_group)
+        self.swapped.push_back(seq_group)
 
     def _swap_in(
         self,
