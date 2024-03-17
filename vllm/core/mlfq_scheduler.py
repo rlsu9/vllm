@@ -162,10 +162,10 @@ class MLFQScheduler:
         self.use_skip_join = use_skip_join
         self.iteration_num = 0
         # Load profiling results
-        if use_skip_join:
-            assert (
-                scheduler_config.profiling_file is not None
-            ), "skip-join MLFQ needs profiling results"
+        # if use_skip_join:
+        #     assert (
+        #         scheduler_config.profiling_file is not None
+        #     ), "skip-join MLFQ needs profiling results"
         # profiling_db = ProfilingDatabase(
         #     scheduler_config.profiling_file, new_database=False
         # )
@@ -207,6 +207,27 @@ class MLFQScheduler:
     @property
     def lora_enabled(self) -> bool:
         return bool(self.lora_config)
+    
+    def _profile_prompt_phrase(self, request: SequenceGroup) -> float:
+        bw = (
+            request.sampling_params.best_of
+            if request.sampling_params.use_beam_search
+            else 1
+        )
+        batch_size = self.scheduler_config.max_batch_size
+        input_len = request.get_input_len()
+        pp = 1
+        tp = 1
+
+        latency_list = self.profile_res.get_latency_list(
+            pp,
+            tp,
+            batch_size,
+            bw,
+            input_len,
+        )
+        
+        return latency_list[0]
 
     def add_seq_group(self, seq_group: SequenceGroup) -> None:
         if self.use_skip_join:
@@ -257,6 +278,7 @@ class MLFQScheduler:
                     self.free_seq(seq)
         for request_id in request_ids:
              self.waiting.del_request(request_id)
+             self.swapped.del_request(request_id)
 
     def has_unfinished_seqs(self) -> bool:
         return self.waiting
@@ -389,7 +411,8 @@ class MLFQScheduler:
             self.iteration_num += 1
             
             if self.iteration_num % self.starvation_period == 0:
-                self.prevent_starvation()
+                self.prevent_starvation(self.waiting)
+                self.prevent_starvation(self.swapped)
     
             if scheduled or ignored_seq_groups:
                 scheduler_outputs = SchedulerOutputs(
@@ -481,7 +504,8 @@ class MLFQScheduler:
         self.iteration_num += 1
             
         if self.iteration_num % self.starvation_period == 0:
-            self.prevent_starvation()
+            self.prevent_starvation(self.waiting)
+            self.prevent_starvation(self.swapped)
 
         # Each sequence in the generation phase only takes one token slot.
         # Therefore, the number of batched tokens is equal to the number of
