@@ -2,7 +2,10 @@ from typing import List
 import pytest  # noqa
 
 from vllm.config import CacheConfig, SchedulerConfig
+import sys
+sys.path.append("../../core/mlfq_scheduler.py")
 from vllm.core.scheduler import Scheduler
+from vllm.core.mlfq_scheduler import MLFQScheduler
 from vllm.sequence import SequenceGroup, Logprob
 
 from utils import create_dummy_prompt
@@ -14,7 +17,7 @@ def test_scheduler_add_seq_group():
     cache_config = CacheConfig(block_size, 1.0, 1, "auto")
     cache_config.num_cpu_blocks = 4
     cache_config.num_gpu_blocks = 4
-    scheduler = Scheduler(scheduler_config, cache_config, None)
+    scheduler = MLFQScheduler(scheduler_config, cache_config, None)
 
     # Add seq group to scheduler.
     num_seq_group = 4
@@ -30,7 +33,7 @@ def test_scheduler_abort_seq_group():
     cache_config = CacheConfig(block_size, 1.0, 1, "auto")
     cache_config.num_cpu_blocks = 4
     cache_config.num_gpu_blocks = 4
-    scheduler = Scheduler(scheduler_config, cache_config, None)
+    scheduler = MLFQScheduler(scheduler_config, cache_config, None)
 
     # Add multiple seq groups to scheduler.
     num_seq_group = 4
@@ -54,7 +57,7 @@ def test_scheduler_schedule_simple():
     cache_config = CacheConfig(block_size, 1.0, 1, "auto")
     cache_config.num_cpu_blocks = 8
     cache_config.num_gpu_blocks = 8
-    scheduler = Scheduler(scheduler_config, cache_config, None)
+    scheduler = MLFQScheduler(scheduler_config, cache_config, None)
 
     # Add seq groups to scheduler.
     running: List[SequenceGroup] = []
@@ -88,7 +91,7 @@ def test_scheduler_schedule_preempt_abort():
     cache_config = CacheConfig(block_size, 1.0, 1, "auto")
     cache_config.num_cpu_blocks = 2
     cache_config.num_gpu_blocks = 2
-    scheduler = Scheduler(scheduler_config, cache_config, None)
+    scheduler = MLFQScheduler(scheduler_config, cache_config, None)
 
     # Add seq groups to scheduler.
     seq_a, seq_group_a = create_dummy_prompt("1", block_size)
@@ -140,7 +143,7 @@ def test_scheduler_max_seqs():
     cache_config = CacheConfig(block_size, 1.0, 1, "auto")
     cache_config.num_cpu_blocks = 8
     cache_config.num_gpu_blocks = 8
-    scheduler = Scheduler(scheduler_config, cache_config, None)
+    scheduler = MLFQScheduler(scheduler_config, cache_config, None)
 
     all_seq_groups: List[SequenceGroup] = []
     # Add seq groups to scheduler.
@@ -175,6 +178,7 @@ def main():
     test_scheduler_schedule_simple()
     test_scheduler_schedule_preempt_abort()
     test_scheduler_max_seqs()
+    print("all test successfully passed")
     
     
 
