@@ -291,13 +291,13 @@ class MLFQScheduler:
         Prevent starvation of the request by promoting it to the top queue.
         """
         promote_reqs = []
-        cur_time = time.time()
+        cur_time = time.monotonic()
         
         for q in priority_queues.queues:
             buffer = []
             while len(q) > 0:
                 request = q.pop_front()
-                if cur_time - request.metrics.time_in_queue  >= self.starvation_threshold:
+                if cur_time - request.metrics.arrival_time  >= self.starvation_threshold:
                     promote_reqs.append(request)
                 else:
                     buffer.append(request)
@@ -318,9 +318,22 @@ class MLFQScheduler:
 
         # Fix the current time.
         now = time.monotonic()
+        
+        def waiting_get_heigher_priorty(self):
+            if len(self.swapped) and len(self.waiting):
+                swapped_first_seq_group = self.swapped.pop_front()
+                waiting_first_seq_group = self.waiting.pop_front()
+                swapped_first_seq_group_priority = swapped_first_seq_group.get_priority()
+                waiting_first_seq_group_priority = waiting_first_seq_group.get_priority()
+                swapped_first_seq_group_arr_time = swapped_first_seq_group.metrics.arrival_time
+                waiting_first_seq_group_arr_time = waiting_first_seq_group.metrics.arrival_time
+                self.swapped.push_front(swapped_first_seq_group)
+                self.waiting.push_front(waiting_first_seq_group)
+                return (waiting_first_seq_group_priority >= swapped_first_seq_group_priority) and (waiting_first_seq_group_arr_time <= swapped_first_seq_group_arr_time)
+            return False
 
         # Join waiting sequences if possible.
-        if  len(self.swapped) == 0:
+        if  len(self.swapped) == 0 or waiting_get_heigher_priorty(self):
             ignored_seq_groups: List[SequenceGroup] = []
             scheduled: List[SequenceGroup] = []
             # The total number of sequences on the fly, including the
@@ -567,8 +580,22 @@ class MLFQScheduler:
         self.block_manager.free(seq)
 
     def free_finished_seq_groups(self) -> None:
-        self.running = deque(seq_group for seq_group in self.running
-                             if not seq_group.is_finished())
+        temp_running = deque()
+        for seq_group in self.running:
+            if not seq_group.is_finished():
+                 # put the request back to mlfq and try to demote it
+                current_time = time.monotonic()
+                if (current_time - seq_group.metrics.arrival_time) > self.base_quantum * pow(
+                    self.threshold, seq_group.get_priority()
+                ):
+                    seq_group.set_priority(seq_group.get_priority() + 1)
+                    seq_group.metrics.arrival_time =  current_time
+                    self.swapped.push_front(seq_group)
+                    continue
+                else:           
+                    temp_running.append(seq_group)
+        self.running = temp_running
+        
 
     def _allocate(self, seq_group: SequenceGroup) -> None:
         self.block_manager.allocate(seq_group)
